@@ -27,21 +27,47 @@ def release_view(store: Store, rel: dict, repo_names) -> dict:
     activated = []
     for repo in repo_names:
         entry = receipts.get(repo, {})
-        repos[repo] = {
-            core.OP_PREPARE: entry.get(core.OP_PREPARE),
-            core.OP_ACTIVATE: entry.get(core.OP_ACTIVATE),
-        }
+        prep = entry.get(core.OP_PREPARE)
         act = entry.get(core.OP_ACTIVATE)
+        repos[repo] = {
+            core.OP_PREPARE: prep,
+            core.OP_ACTIVATE: act,
+            # Why this repo grants/withholds activation eligibility.
+            "activation_evidence": (
+                "present" if act else "absent"
+            ),
+            "activate_digest_matches": (
+                act.get("digest") == rel["sha256"] if act else None
+            ),
+            "prepare_digest_matches": (
+                prep.get("digest") == rel["sha256"] if prep else None
+            ),
+        }
         activated.append(act.get("digest") if act else None)
     # The "current digest" is only real once both repos activated the same sha.
     current = rel["sha256"] if all(d == rel["sha256"] for d in activated) else None
+
+    # Position of this release in the durable first-persist queue.
+    position = None
+    ahead: list[dict] = []
+    if rel.get("seq") is not None:
+        for i, r in enumerate(store.ordered_releases()):
+            if r["release_id"] == rel["release_id"]:
+                position = i
+            elif position is None and r["state"] not in core.TERMINAL_STATES:
+                ahead.append({"release_id": r["release_id"], "state": r["state"]})
+
     return {
         "release_id": rel["release_id"],
+        "seq": rel.get("seq"),
         "sha256": rel["sha256"],
         "size": rel["size"],
         "state": rel["state"],
         "error": rel["error"],
+        "superseded_by": rel.get("superseded_by"),
         "current_digest": current,
+        "queue_position": position,
+        "waiting_for": ahead if rel["state"] == core.STATE_WAITING else [],
         "created_at": rel["created_at"],
         "updated_at": rel["updated_at"],
         "repos": repos,

@@ -1,10 +1,24 @@
-"""Release state machine: drives prepare/activate across both mirror repos.
+"""Release state machine: a single activation fence across both mirror repos.
 
-Crash-safety model: the release intent is persisted before any repo call, and
-every repo receipt is persisted locally as soon as it is observed. Before
-issuing an operation the machine first asks the repo for an existing receipt
-under the derived op key, so a control-service restart converges from
-repo-side receipts without ever re-executing an operation.
+Publication order is the order in which release intents were first persisted
+(an immutable monotonic ``seq``). At any moment only the oldest still-live
+candidate (the fence head) may drive repository operations, and the same
+candidate is activated on BOTH repos, so the two repo active pointers can never
+belong to releases at different positions in the queue.
+
+Supersession rule:
+  - A fence head that has left NO persisted activation evidence in either repo
+    may be overtaken by a later submission: it is locked as SUPERSEDED (recording
+    which release replaced it) and must never trigger prepare/activate again.
+  - As soon as the head has persisted activation evidence in ANY repo, later
+    candidates WAIT until it converges to COMPLETED or REJECTED from the
+    existing receipts; only then does the next candidate enter coordination.
+
+Crash safety: intents are persisted before any repo call and every observed
+repo receipt is persisted immediately. Evidence absence is only acted upon when
+BOTH repos authoritatively answer 404 for the derived activate op key; an
+unreachable repo means the head is retained, so a response loss followed by a
+restart can never let a newer release jump an activation that already happened.
 """
 from __future__ import annotations
 
@@ -18,6 +32,10 @@ from app.control import core
 
 log = logging.getLogger("control.machine")
 
+EVIDENCE_PRESENT = "present"
+EVIDENCE_ABSENT = "absent"
+EVIDENCE_UNKNOWN = "unknown"
+
 
 class Rejected(Exception):
     """Internal signal: the release has just been locked as REJECTED."""
@@ -28,6 +46,42 @@ class ReleaseMachine:
         self.store = store
         self.clients = clients  # repo name -> RepoClient
         self.secrets = secrets  # repo name -> HMAC secret
+
+    def reconcile(self) -> None:
+        """One fence pass: supersede stale heads, then advance only the head."""
+        ordered = self.store.pending_release_ids(core.TERMINAL_STATES)
+        # Resolve any chain of evidence-free stale heads in publication order.
+        while len(ordered) >= 2:
+            head_id = ordered[0]
+            head = self.store.get_release(head_id)
+            if head is None or head["state"] in core.TERMINAL_STATES:
+                ordered.pop(0)
+                continue
+            try:
+                evidence = self._probe_activation_evidence(head)
+            except Rejected:
+                # Probing adopted a bad receipt which locked the head REJECTED;
+                # re-read on the next tick rather than touching the fence now.
+                return
+            if any(v == EVIDENCE_UNKNOWN for v in evidence.values()):
+                break  # cannot prove absence: retain the head this tick
+            if all(v == EVIDENCE_ABSENT for v in evidence.values()):
+                overtaken_by = ordered[1]
+                if self.store.mark_superseded(head_id, overtaken_by):
+                    log.info("release %s superseded by %s before any activation",
+                             head_id, overtaken_by)
+                ordered.pop(0)
+                continue
+            break  # head already holds activation evidence: it owns the fence
+        if not ordered:
+            return
+        # Everyone behind the head queues behind the fence.
+        for follower_id in ordered[1:]:
+            follower = self.store.get_release(follower_id)
+            if follower and follower["state"] not in core.TERMINAL_STATES \
+                    and follower["state"] != core.STATE_WAITING:
+                self.store.update_state(follower_id, core.STATE_WAITING)
+        self.advance(ordered[0])
 
     def advance(self, release_id: str) -> None:
         rel = self.store.get_release(release_id)
@@ -64,6 +118,37 @@ class ReleaseMachine:
 
         self._set_state(rid, core.STATE_COMPLETED)
         log.info("release %s completed (sha256=%s)", rid, sha)
+
+    def _probe_activation_evidence(self, rel: dict) -> dict:
+        """Authoritative per-repo view of persisted ACTIVATE evidence.
+
+        Read-only with respect to the repos: it adopts an existing receipt via
+        GET but never issues an activation. EVIDENCE_ABSENT is returned only
+        when the repo explicitly answers 404; an unreachable repo is UNKNOWN.
+        """
+        rid = rel["release_id"]
+        out: dict = {}
+        for repo in self.clients:
+            if self.store.get_receipt(rid, repo, core.OP_ACTIVATE) is not None:
+                out[repo] = EVIDENCE_PRESENT
+                continue
+            client = self.clients[repo]
+            key = core.op_key(rid, repo, core.OP_ACTIVATE)
+            try:
+                status, body = client.get_op(key)
+            except TransportError as e:
+                log.warning("activation evidence for %s in %s unknown: %s", rid, repo, e)
+                out[repo] = EVIDENCE_UNKNOWN
+                continue
+            if status == 200:
+                self._adopt(rid, repo, core.OP_ACTIVATE, key, body.get("receipt"))
+                out[repo] = EVIDENCE_PRESENT
+            elif status == 404:
+                out[repo] = EVIDENCE_ABSENT
+            else:
+                log.warning("activation evidence probe %s %s -> HTTP %s", rid, repo, status)
+                out[repo] = EVIDENCE_UNKNOWN
+        return out
 
     def _ensure_op(self, rid: str, repo: str, op: str, sha: str,
                    artifact_b64: str) -> dict | None:
@@ -151,10 +236,12 @@ class ReleaseMachine:
 
 
 class Worker(threading.Thread):
-    """Background reconciler: advances every non-terminal release.
+    """Background reconciler: advances the single activation fence.
 
     On process start it picks up all unfinished releases from the durable
-    store, which is what makes a control-service restart converge.
+    store in publication order, which is what makes a control-service restart
+    recover the exact same queue conclusion (supersession included) from
+    persisted intents and repository receipts.
     """
 
     def __init__(self, store, machine: ReleaseMachine, interval: float = 0.5):
@@ -170,10 +257,7 @@ class Worker(threading.Thread):
     def run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                for rid in self.store.pending_release_ids(core.TERMINAL_STATES):
-                    if self._stop_event.is_set():
-                        break
-                    self.machine.advance(rid)
+                self.machine.reconcile()
             except Exception:  # noqa: BLE001 - never kill the worker
                 log.exception("worker tick failed")
             self._stop_event.wait(self.interval)

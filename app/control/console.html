@@ -22,7 +22,11 @@
   .mono { font-family: ui-monospace, monospace; font-size: .78rem; word-break: break-all; }
   .state-COMPLETED { color: #1c9c4c; font-weight: 700; }
   .state-REJECTED { color: #d05050; font-weight: 700; }
+  .state-SUPERSEDED { color: #8a8a8a; font-weight: 700; }
   .state-PENDING, .state-PREPARING, .state-ACTIVATING { color: #c08a00; font-weight: 700; }
+  .state-WAITING { color: #3574c8; font-weight: 700; }
+  .tag { display: inline-block; font-size: .72rem; padding: .05rem .4rem; border-radius: 10px;
+         border: 1px solid #8884; margin-left: .35rem; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -105,11 +109,17 @@ $("publish").addEventListener("click", async () => {
   }
 });
 
-function receiptRow(repo, op, r) {
-  if (!r) return `<tr><td>${repo}</td><td>${op}</td><td colspan="4">—</td></tr>`;
-  return `<tr><td>${repo}</td><td>${op}</td><td class="mono">${short(r.digest)}</td>` +
-    `<td class="mono">${short(r.receipt_id)}</td><td>${r.ts || ""}</td>` +
-    `<td>${r.sig ? "✓" : "—"}</td></tr>`;
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g,
+    (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function stateBadge(state) {
+  const labels = { PENDING: "等待中", PREPARING: "准备中", ACTIVATING: "激活中",
+                   WAITING: "排队等待", SUPERSEDED: "已淘汰",
+                   COMPLETED: "已完成", REJECTED: "已拒绝" };
+  return `<span class="state-${state}">${state}</span>` +
+         (labels[state] ? `<span class="tag">${labels[state]}</span>` : "");
 }
 
 async function query() {
@@ -117,35 +127,88 @@ async function query() {
   if (!rid) { $("detail").innerHTML = ""; return; }
   const { status, body } = await api("GET", "/api/releases/" + encodeURIComponent(rid));
   if (status !== 200) {
-    $("detail").innerHTML = `<p>${(body.error && body.error.message) || "查询失败"}</p>`;
+    $("detail").innerHTML = `<p>${esc((body.error && body.error.message) || "查询失败")}</p>`;
     return;
   }
-  let html = `<p>状态：<span class="state-${body.state}">${body.state}</span><br>` +
-    `SHA-256：<code>${body.sha256}</code><br>` +
-    `当前摘要：<code>${body.current_digest || "—"}</code><br>` +
-    (body.error ? `错误：<code>${body.error}</code><br>` : "") +
+  let html = `<p>状态：${stateBadge(body.state)}<br>` +
+    `顺位（首次持久化顺序）：<code>${body.seq ?? "—"}</code>` +
+    (typeof body.queue_position === "number" ? `（队列第 ${body.queue_position + 1} 项）` : "") + `<br>` +
+    `SHA-256：<code>${esc(body.sha256)}</code><br>` +
+    `当前活动摘要：<code>${esc(body.current_digest || "—")}</code><br>` +
     `大小：${body.size} 字节</p>`;
-  html += `<table><tr><th>镜像仓</th><th>操作</th><th>摘要</th><th>回执 ID</th>` +
-    `<th>时间</th><th>签名</th></tr>`;
+
+  if (body.state === "SUPERSEDED") {
+    html += `<p class="state-SUPERSEDED">该候选尚未在任一镜像仓留下持久化激活证据，` +
+            `已被较新的发布 <code>${esc(body.superseded_by || "?")}</code> 淘汰，` +
+            `不会再触发准备或激活。</p>`;
+  } else if (body.state === "WAITING") {
+    const ahead = (body.waiting_for || []).map(w =>
+      `<code>${esc(w.release_id)}</code>（${w.state}）`).join("、") || "前序发布";
+    html += `<p class="state-WAITING">前序发布已持有至少一仓的持久化激活证据，` +
+            `本候选正在栅栏后等待其收敛为完成或拒绝：${ahead}。` +
+            `两仓活动指针在任意时刻都不会分属不同顺位的发布。</p>`;
+  } else if (body.state === "COMPLETED") {
+    html += `<p class="state-COMPLETED">两仓激活回执摘要均等于发布 SHA-256，获得激活资格。</p>`;
+  } else if (body.state === "REJECTED") {
+    html += `<p class="state-REJECTED">拒绝原因：<code>${esc(body.error || "")}</code></p>`;
+  }
+
+  html += `<table><tr><th>镜像仓</th><th>操作</th><th>摘要</th><th>摘要匹配</th>` +
+    `<th>回执 ID</th><th>时间</th><th>签名</th><th>激活资格判定</th></tr>`;
   for (const repo of Object.keys(body.repos)) {
-    html += receiptRow(repo, "prepare", body.repos[repo].prepare);
-    html += receiptRow(repo, "activate", body.repos[repo].activate);
+    html += receiptRow(repo, "prepare", body.repos[repo], body.sha256);
+    html += receiptRow(repo, "activate", body.repos[repo], body.sha256);
   }
   html += "</table>";
   $("detail").innerHTML = html;
+}
+
+function receiptRow(repo, op, info, sha) {
+  const r = info[op];
+  const matches = op === "prepare" ? info.prepare_digest_matches
+                                   : info.activate_digest_matches;
+  let verdict = "";
+  if (op === "activate") {
+    if (!r) verdict = `尚无激活证据${info.activation_evidence === "absent" ? "（未越线：两仓权威确认缺失前仍受栅栏保护）" : ""}`;
+    else if (matches) verdict = "✓ 持久化激活且摘要属于本发布（持有栅栏，后续候选须等待）";
+    else verdict = "✗ 激活回执摘要不属于本发布（发布锁定为拒绝）";
+  } else {
+    if (!r) verdict = "尚无准备证据";
+    else verdict = matches ? "✓ 准备摘要属于本发布" : "✗ 准备摘要不属于本发布";
+  }
+  if (!r) {
+    return `<tr><td>${repo}</td><td>${op}</td><td colspan="5">—</td><td>${esc(verdict)}</td></tr>`;
+  }
+  return `<tr><td>${repo}</td><td>${op}</td><td class="mono">${esc(short(r.digest))}</td>` +
+    `<td>${matches === true ? "✓" : (matches === false ? "✗" : "—")}</td>` +
+    `<td class="mono">${esc(short(r.receipt_id))}</td><td>${esc(r.ts || "")}</td>` +
+    `<td>${r.sig ? "✓" : "—"}</td><td>${esc(verdict)}</td></tr>`;
 }
 
 $("query").addEventListener("click", query);
 
 async function refreshList() {
   const { body } = await api("GET", "/api/releases");
-  const rows = (body.releases || []).map(r =>
-    `<tr><td class="mono">${r.release_id}</td><td class="mono">${short(r.sha256)}</td>` +
-    `<td class="state-${r.state}">${r.state}</td><td>${r.size}</td>` +
-    `<td>${r.updated_at}</td></tr>`).join("");
+  const rows = (body.releases || []).map(r => {
+    let note = "";
+    if (r.state === "SUPERSEDED") {
+      note = `已被 <code>${esc(r.superseded_by || "?")}</code> 取代`;
+    } else if (r.state === "WAITING") {
+      note = "栅栏后排队";
+    } else if (r.state === "COMPLETED") {
+      note = "两仓已激活";
+    } else if (r.state === "REJECTED") {
+      note = "已锁定拒绝";
+    } else {
+      note = "协调中";
+    }
+    return `<tr><td>${r.seq ?? "—"}</td><td class="mono">${esc(r.release_id)}</td>` +
+      `<td class="mono">${esc(short(r.sha256))}</td><td>${stateBadge(r.state)}</td>` +
+      `<td>${r.size}</td><td>${note}</td><td>${esc(r.updated_at)}</td></tr>`;
+  }).join("");
   $("list").innerHTML = rows
-    ? `<table><tr><th>发布标识</th><th>SHA-256</th><th>状态</th><th>大小</th>` +
-      `<th>更新时间</th></tr>${rows}</table>`
+    ? `<table><tr><th>顺位</th><th>发布标识</th><th>SHA-256</th><th>状态</th>` +
+      `<th>大小</th><th>栅栏说明</th><th>更新时间</th></tr>${rows}</table>`
     : "<p>暂无发布</p>";
 }
 

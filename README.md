@@ -37,7 +37,19 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 ## 关键语义
 
 - **先持久化，后执行**：`POST /api/releases` 先把 `sha256` 与不可变发布意图
-  （标识 → 摘要 + 字节）写入 SQLite，再由后台协调器驱动仓端操作。
+  （标识 → 摘要 + 字节）写入 SQLite（同时分配单调的首次持久化顺位 `seq`），
+  再由后台协调器按顺位驱动仓端操作。
+- **单一激活栅栏（按首次持久化顺序）**：任意时刻只有顺位最靠前的存活候选
+  （栅栏头）能驱动仓端操作，且两仓都被同一候选激活，随后才轮到下一发布。
+  - 旧候选**未在任一仓留下持久化激活证据**时，可被后续提交**淘汰**：锁定为
+    `SUPERSEDED` 并记录 `superseded_by`（被哪一发布取代），此后不再触发准备
+    或激活。是否「无证据」只在两仓都对派生的激活操作键**权威回答 404** 时才
+    成立；任一仓不可达（无法证明缺失）则保留旧候选，杜绝响应丢失/重启后
+    新候选越过实际已发生的激活。
+  - 旧候选**已有任一仓持久化激活证据**时，后续候选置 `WAITING`，必须等待旧
+    候选依据既有回执收敛为 `COMPLETED`/`REJECTED`，再依序进入协调；因此两仓
+    活动指针不会因队列跳跃而分属不同顺位的发布，旧工件也不可能稍后再切换覆盖
+    新结果。
 - **仓端操作键**：`rel:{发布标识}:{仓}:{prepare|activate}`，由发布标识派生。
   仓端按键幂等：同键同摘要回放**首次回执**（receipt_id 不变、激活计数不增）；
   同键异摘要返回 `409 op_key_conflict` 明确拒绝。
@@ -45,13 +57,26 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
   此时 `current_digest` 才对外可见。
 - **断连收敛**：若一仓在持久化激活后断开响应，控制服务重启后会先向仓端
   `GET /v1/ops/{op_key}` 认领既有回执，依据仓端回执收敛为完成，绝不二次激活。
+  栅栏的队列结论（淘汰/等待/推进）同样完全由持久化意图与仓端回执重建。
 - **拒绝锁定**：任一仓返回不属于该发布的摘要（或证据签名不符、操作键冲突）时，
   发布锁定为 `REJECTED`，`current_digest` 保持为空，仓端活动指针不被改写，
-  且状态不再漂移。
+  且状态不再漂移；后继候选随后可越过栅栏依序进行。
 - **幂等提交**：相同标识 + 相同工件 → `200` 回放当前状态，不产生第二次激活；
   相同标识 + 不同工件 → `409 release_id_in_use`，既有成功发布的真实状态保留；
   非法 Base64 → `400 invalid_base64`；超限工件 → `413 artifact_too_large`
   （恰为 64KiB 可正常发布）。
+
+## 发布状态
+
+| 状态 | 含义 |
+| --- | --- |
+| `PENDING` | 已持久化意图，尚未开始准备 |
+| `PREPARING` | 正在双仓准备（至少一仓尚未准备就绪） |
+| `ACTIVATING` | 双仓已准备，正在激活（栅栏头） |
+| `WAITING` | 前序候选仍持有至少一仓的激活证据，本候选在栅栏后等待 |
+| `SUPERSEDED` | 未留下任何仓端激活证据即被更新发布取代（`superseded_by`），不再触发操作 |
+| `COMPLETED` | 两仓激活回执摘要均等于发布 SHA-256，`current_digest` 可见 |
+| `REJECTED` | 证据冲突，已锁定拒绝（`error` 记录原因） |
 
 ## API 摘要（控制服务）
 
@@ -60,7 +85,7 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 | GET | `/` | 控制台页面（发布表单 + 反馈区 + 按标识查询证据） |
 | GET | `/healthz` | 健康响应（含 `boot_id`） |
 | POST | `/api/releases` | 提交 `{release_id, artifact_b64}` → `202/200/409/400/413` |
-| GET | `/api/releases/{id}` | 进度、当前摘要、双仓准备/激活证据（签名回执） |
+| GET | `/api/releases/{id}` | 进度、当前摘要、顺位/队列位置、`superseded_by`/`waiting_for` 及双仓准备/激活证据（签名回执 + 每条证据的资格判定） |
 | GET | `/api/releases` | 全部发布列表 |
 
 仓端（仅内部网络）：`POST /v1/prepare`、`POST /v1/activate`、
@@ -73,10 +98,14 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 1. **断连/重启场景**：武装 repo-b「激活提交后断开响应」→ 提交发布 →
    确认卡在未完成态 → 重启控制服务（新 `boot_id`）→ 恢复 repo-b →
    校验双仓最终摘要、激活次数恰为 1、准备/激活证据完整且为首次回执回放。
-2. **代码测试**：`python -m unittest discover`（单元 + 进程内集成测试，
-   集成测试覆盖同一断连/重启场景）。
-3. **构建检查**：`python -m compileall` 字节编译全部源码。
-4. **HTTP 冒烟**：健康页与发布接口（重复提交、标识复用、非法 Base64、
+2. **单一激活栅栏场景**：双仓保持可达但暂不提交激活（`stall-activate`，
+   激活操作键权威返回 404）→ 旧候选被更新发布淘汰（`SUPERSEDED` 且
+   `superseded_by` 正确、绝不激活）→ 再构造旧候选已持有一仓激活证据、
+   另一仓暂无证据，验证新候选 `WAITING` 且不触碰仓端，旧候选收敛后才依序完成。
+3. **代码测试**：`python -m unittest discover`（单元 + 进程内集成测试，
+   集成测试覆盖断连/重启与全部栅栏场景）。
+4. **构建检查**：`python -m compileall` 字节编译全部源码。
+5. **HTTP 冒烟**：健康页与发布接口（重复提交、标识复用、非法 Base64、
    超限与 64KiB 边界、拒绝锁定、仓端幂等直测、未知标识 404）。
 
 退出码 `0` = 验收通过，非 `0` = 存在失败项（日志中逐条标注 `[FAIL]`）。
@@ -92,8 +121,11 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 
 故障注入接口（仅 `FAULT_HOOKS=1` 时挂载）：仓端 `/fault/disconnect`、
 `/fault/recover`、`/fault/disconnect-after-activate`、
-`/fault/corrupt-next-activate`；控制端 `/fault/restart`（进程退出，
+`/fault/corrupt-next-activate`、`/fault/stall-activate`、
+`/fault/unstall-activate`；控制端 `/fault/restart`（进程退出，
 由 `restart: on-failure` 拉回，用于验收重启收敛）。
+`stall-activate` 让仓保持可达但暂不提交激活（激活操作键仍权威返回 404），
+用于确定性构造「尚无激活证据」的淘汰窗口。
 
 ## 本地开发（无 Docker）
 

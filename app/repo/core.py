@@ -47,6 +47,15 @@ class DisconnectedAfterCommit(Exception):
     """The op was committed, but the repo now simulates a dropped response."""
 
 
+class ActivateStalled(Exception):
+    """Transient refusal to commit an activation (nothing is persisted).
+
+    Unlike disconnect-after-activate the repo stays reachable: GET on the
+    activate op key authoritatively answers 404, which is exactly the
+    "no persisted activation evidence yet" window the activation fence uses.
+    """
+
+
 class RepoCore:
     def __init__(self, db_path: str, name: str, secret: str):
         parent = os.path.dirname(db_path)
@@ -66,6 +75,7 @@ class RepoCore:
         self.disconnected = False
         self._arm_disconnect_after_activate = False
         self._arm_corrupt_next_activate = False
+        self._stall_activate = False
 
     def close(self) -> None:
         with self._lock:
@@ -86,12 +96,17 @@ class RepoCore:
         with self._lock:
             self._arm_corrupt_next_activate = True
 
+    def set_stall_activate(self, flag: bool) -> None:
+        with self._lock:
+            self._stall_activate = flag
+
     def fault_state(self) -> dict:
         with self._lock:
             return {
                 "disconnected": self.disconnected,
                 "disconnect_after_activate": self._arm_disconnect_after_activate,
                 "corrupt_next_activate": self._arm_corrupt_next_activate,
+                "stall_activate": self._stall_activate,
             }
 
     # ---- operations ----
@@ -136,6 +151,10 @@ class RepoCore:
             ).fetchone()
             if not staged:
                 raise NotPrepared(digest)
+            if self._stall_activate:
+                # Repo is reachable but transiently refuses to commit the
+                # activation: no op row, no pointer change, GET stays 404.
+                raise ActivateStalled()
             if self._arm_corrupt_next_activate:
                 self._arm_corrupt_next_activate = False
                 # Misbehaving repo: returns a well-formed, properly signed receipt

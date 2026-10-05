@@ -11,6 +11,7 @@ import threading
 
 from app.common.httpjson import ApiError, App, make_server
 from app.repo.core import (
+    ActivateStalled,
     Conflict,
     DisconnectedAfterCommit,
     NotPrepared,
@@ -75,6 +76,10 @@ def build_app(core: RepoCore, fault_hooks: bool = False) -> App:
             receipt, created = core.activate(op_key, digest)
         except NotPrepared:
             raise ApiError(400, "not_prepared", "该摘要尚未在仓内准备")
+        except ActivateStalled:
+            # Transient: the repo stays reachable and GET on the op key is 404,
+            # so callers can authoritatively observe "no activation evidence".
+            raise ApiError(503, "activate_stalled", "镜像仓暂不接受激活（尚无持久化证据）")
         except Conflict as e:
             raise ApiError(409, "op_key_conflict", "操作键已绑定不同摘要",
                            {"existing_digest": e.existing_digest})
@@ -118,6 +123,16 @@ def build_app(core: RepoCore, fault_hooks: bool = False) -> App:
             core.arm_corrupt_next_activate()
             return {"armed": "corrupt-next-activate"}
 
+        @app.route("POST", "/fault/stall-activate")
+        def fault_stall_activate(req):
+            core.set_stall_activate(True)
+            return {"stall_activate": True}
+
+        @app.route("POST", "/fault/unstall-activate")
+        def fault_unstall_activate(req):
+            core.set_stall_activate(False)
+            return {"stall_activate": False}
+
         @app.route("GET", "/fault/state")
         def fault_state(req):
             return core.fault_state()
@@ -136,6 +151,10 @@ class RepoService:
     @property
     def port(self) -> int:
         return self.httpd.server_address[1]
+
+    @property
+    def name(self) -> str:
+        return self.core.name
 
     @property
     def url(self) -> str:

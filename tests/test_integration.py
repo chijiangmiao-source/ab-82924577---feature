@@ -96,6 +96,14 @@ class IntegrationTests(unittest.TestCase):
     def repo_state(self, repo) -> dict:
         return http_json("GET", f"{repo.url}/v1/state", timeout=5)[1]
 
+    def set_stall(self, repo, flag: bool):
+        path = "/fault/stall-activate" if flag else "/fault/unstall-activate"
+        return http_json("POST", f"{repo.url}{path}", {}, timeout=5)
+
+    def activate_op_status(self, repo, rid: str, op: str = "activate") -> int:
+        key = urllib.parse.quote(op_key(rid, repo.name, op), safe="")
+        return http_json("GET", f"{repo.url}/v1/ops/{key}", timeout=5)[0]
+
     # ---- tests ----
     def test_happy_path_and_idempotent_duplicate(self):
         s, b = self.post_release("rel-1", b"payload-1")
@@ -220,6 +228,146 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(s, 200)
         self.assertIn('id="feedback"', text)
         self.assertIn('id="artifact"', text)
+
+    # ---- activation fence ----
+    def test_new_candidate_supersedes_head_without_activation_evidence(self):
+        # Stall both repos' activations while staying reachable (GET op -> 404).
+        self.set_stall(self.c.repo_a, True)
+        self.set_stall(self.c.repo_b, True)
+        self.post_release("rel-old", b"old")
+        d = wait_for(lambda: self.state_of("rel-old") if self.state_of("rel-old").get(
+            "state") == "ACTIVATING" else None)
+        # Prepares landed for both repos, but no activation evidence exists yet.
+        for repo in (self.c.repo_a, self.c.repo_b):
+            self.assertEqual(self.activate_op_status(repo, "rel-old"), 404)
+
+        # A newer candidate overtakes the evidence-free old one.
+        self.post_release("rel-new", b"new")
+        old = self.wait_state("rel-old", "SUPERSEDED")
+        self.assertEqual(old["superseded_by"], "rel-new")
+        self.assertIsNone(old["current_digest"])
+
+        # Release the stall; the newer release must be the only activation.
+        self.set_stall(self.c.repo_a, False)
+        self.set_stall(self.c.repo_b, False)
+        new = self.wait_state("rel-new", "COMPLETED")
+        self.assertEqual(new["current_digest"], sha(b"new"))
+
+        time.sleep(0.6)
+        old = self.state_of("rel-old")
+        self.assertEqual(old["state"], "SUPERSEDED")  # locked, never re-prepared
+        for repo in (self.c.repo_a, self.c.repo_b):
+            # The old candidate never activated: no activate op, pointer is new.
+            self.assertEqual(self.activate_op_status(repo, "rel-old"), 404)
+            st = self.repo_state(repo)
+            self.assertEqual(st["active_digest"], sha(b"new"))
+            self.assertEqual(st["activation_count"], 1)
+
+    def test_head_with_one_activation_evidence_blocks_newer_candidates(self):
+        # repo-a commits its activation first; repo-b is stalled (reachable,
+        # GET activate op -> 404). One persisted activation must hold the fence.
+        self.set_stall(self.c.repo_b, True)
+        self.post_release("rel-head", b"head")
+
+        def head_evidence_partial():
+            d = self.state_of("rel-head")
+            a = (d.get("repos", {}).get("repo-a") or {}).get("activate")
+            bb = (d.get("repos", {}).get("repo-b") or {}).get("activate")
+            return d if (a and not bb) else None
+
+        wait_for(head_evidence_partial)
+        self.assertEqual(self.activate_op_status(self.c.repo_a, "rel-head"), 200)
+        self.assertEqual(self.activate_op_status(self.c.repo_b, "rel-head"), 404)
+
+        # A newer submission must queue behind the fence and never touch a repo.
+        self.post_release("rel-wait", b"wait")
+        w = self.wait_state("rel-wait", "WAITING")
+        self.assertTrue(any(x["release_id"] == "rel-head" for x in w["waiting_for"]))
+        time.sleep(0.8)
+        self.assertEqual(self.state_of("rel-wait")["state"], "WAITING")
+        for repo in (self.c.repo_a, self.c.repo_b):
+            self.assertEqual(self.activate_op_status(repo, "rel-wait"), 404)
+
+        # Let the head converge; only then does the waiter enter coordination.
+        self.set_stall(self.c.repo_b, False)
+        self.wait_state("rel-head", "COMPLETED")
+        waiter = self.wait_state("rel-wait", "COMPLETED")
+        self.assertEqual(waiter["current_digest"], sha(b"wait"))
+
+        time.sleep(0.4)
+        for repo in (self.c.repo_a, self.c.repo_b):
+            self.assertEqual(self.repo_state(repo)["active_digest"], sha(b"wait"))
+        # Each release activated exactly once per repo (never mixed pointers).
+        self.assertEqual(self.repo_state(self.c.repo_a)["activation_count"], 2)
+        self.assertEqual(self.repo_state(self.c.repo_b)["activation_count"], 2)
+
+    def test_rejected_head_releases_fence_to_waiter_in_order(self):
+        self.post_release("rel-h1", b"h1")
+        self.wait_state("rel-h1", "COMPLETED")
+        # Next head will be rejected by repo-b's foreign-digest receipt.
+        http_json("POST", f"{self.c.repo_b.url}/fault/corrupt-next-activate", {}, timeout=5)
+        self.post_release("rel-h2", b"h2")
+        self.wait_state("rel-h2", "REJECTED")
+        self.post_release("rel-h3", b"h3")
+        d = self.wait_state("rel-h3", "COMPLETED")
+        self.assertEqual(d["current_digest"], sha(b"h3"))
+        for repo in (self.c.repo_a, self.c.repo_b):
+            self.assertEqual(self.repo_state(repo)["active_digest"], sha(b"h3"))
+
+    def test_supersession_decision_is_recovered_after_restart(self):
+        self.set_stall(self.c.repo_a, True)
+        self.set_stall(self.c.repo_b, True)
+        self.post_release("rel-r1", b"r1")
+        wait_for(lambda: self.state_of("rel-r1")
+                 if self.state_of("rel-r1").get("state") == "ACTIVATING" else None)
+        self.post_release("rel-r2", b"r2")
+        self.wait_state("rel-r1", "SUPERSEDED")
+        # r2 is WAITING only because repos are stalled and it is now the head.
+        self.wait_state("rel-r2", "ACTIVATING")
+
+        # Restart before any activation exists anywhere; the same queue view
+        # (r1 SUPERSEDED, r2 the sole head) must be reconstructed from durable
+        # intents + authoritative repo 404s.
+        self.c.restart_control()
+        time.sleep(0.6)
+        self.assertEqual(self.state_of("rel-r1")["state"], "SUPERSEDED")
+        self.assertEqual(self.state_of("rel-r1")["superseded_by"], "rel-r2")
+        self.assertNotEqual(self.state_of("rel-r2")["state"], "SUPERSEDED")
+
+        self.set_stall(self.c.repo_a, False)
+        self.set_stall(self.c.repo_b, False)
+        d = self.wait_state("rel-r2", "COMPLETED")
+        self.assertEqual(d["current_digest"], sha(b"r2"))
+        self.assertEqual(self.state_of("rel-r1")["state"], "SUPERSEDED")
+
+    def test_unreachable_repo_blocks_supersession_until_absence_is_provable(self):
+        # repo-a is reachable but stalls the activation (authoritative 404);
+        # repo-b goes dark so its absence cannot be proven.
+        self.set_stall(self.c.repo_a, True)
+        self.set_stall(self.c.repo_b, True)
+        self.post_release("rel-u1", b"u1")
+        self.wait_state("rel-u1", "ACTIVATING")
+        http_json("POST", f"{self.c.repo_b.url}/fault/disconnect", {}, timeout=5)
+        self.post_release("rel-u2", b"u2")
+        time.sleep(1.0)
+        # repo-a 404 but repo-b unknown: absence is NOT provable, head retained.
+        self.assertNotEqual(self.state_of("rel-u1")["state"], "SUPERSEDED")
+        self.assertEqual(self.state_of("rel-u2")["state"], "WAITING")
+
+        # repo-b recovers: BOTH repos authoritatively answer 404, so the old
+        # candidate is proven evidence-free and is now superseded by the newer.
+        http_json("POST", f"{self.c.repo_b.url}/fault/recover", {}, timeout=5)
+        old = self.wait_state("rel-u1", "SUPERSEDED")
+        self.assertEqual(old["superseded_by"], "rel-u2")
+        self.set_stall(self.c.repo_a, False)
+        self.set_stall(self.c.repo_b, False)
+        new = self.wait_state("rel-u2", "COMPLETED")
+        self.assertEqual(new["current_digest"], sha(b"u2"))
+        time.sleep(0.4)
+        for repo in (self.c.repo_a, self.c.repo_b):
+            st = self.repo_state(repo)
+            self.assertEqual(st["active_digest"], sha(b"u2"))
+            self.assertEqual(st["activation_count"], 1)  # old candidate never fired
 
 
 if __name__ == "__main__":

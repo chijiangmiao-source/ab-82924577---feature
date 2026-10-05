@@ -163,6 +163,113 @@ def phase_scenario():
 
 
 # ---------------------------------------------------------------------------
+# Phase B/C extra: single activation fence (supersession + ordered waiting)
+# ---------------------------------------------------------------------------
+def post_release_json(rid: str, artifact: bytes):
+    return http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": rid, "artifact_b64": base64.b64encode(artifact).decode()},
+                     timeout=10)
+
+
+def wait_release(rid: str, state: str, timeout: float = 45.0):
+    def pred():
+        s, b = get_release(rid)
+        return b if s == 200 and b.get("state") == state else None
+    return wait_until(f"release {rid} -> {state}", pred, timeout)
+
+
+def op_status(base_url: str, rid: str, repo: str, op: str) -> int:
+    key = urllib.parse.quote(op_key(rid, repo, op), safe="")
+    return http_json("GET", f"{base_url}/v1/ops/{key}", timeout=5)[0]
+
+
+def phase_fence():
+    print("== 单一激活栅栏：淘汰无激活证据旧候选 + 有证据则按序等待 ==", flush=True)
+    ts = int(time.time())
+
+    # --- Part 1: evidence-free head is overtaken by a newer submission ---
+    for url in (REPO_A_URL, REPO_B_URL):
+        s, _ = http_json("POST", f"{url}/fault/stall-activate", {}, timeout=5)
+        check(f"stall activations on {url}", s == 200, f"status={s}")
+    old_id, new_id = f"fence-old-{ts}", f"fence-new-{ts}"
+    old_art, new_art = b"fence-old-bytes", b"fence-newer-bytes"
+    old_sha, new_sha = sha256_hex(old_art), sha256_hex(new_art)
+    before = {u: repo_state(u)["activation_count"] for u in (REPO_A_URL, REPO_B_URL)}
+
+    s, _ = post_release_json(old_id, old_art)
+    check("old candidate accepted", s == 202, f"status={s}")
+    wait_release(old_id, "ACTIVATING")
+    check("old candidate has no activation evidence yet",
+          op_status(REPO_A_URL, old_id, "repo-a", "activate") == 404
+          and op_status(REPO_B_URL, old_id, "repo-b", "activate") == 404)
+
+    s, _ = post_release_json(new_id, new_art)
+    check("newer candidate accepted", s == 202, f"status={s}")
+    old = wait_release(old_id, "SUPERSEDED")
+    check("old candidate records which release superseded it",
+          old.get("superseded_by") == new_id, f"superseded_by={old.get('superseded_by')}")
+    check("superseded candidate exposes no current digest", old.get("current_digest") is None)
+
+    for url in (REPO_A_URL, REPO_B_URL):
+        http_json("POST", f"{url}/fault/unstall-activate", {}, timeout=5)
+    d = wait_release(new_id, "COMPLETED")
+    check("newer candidate becomes current", d.get("current_digest") == new_sha)
+    time.sleep(1.0)
+    check("superseded candidate stays locked",
+          get_release(old_id)[1].get("state") == "SUPERSEDED")
+    for name, url in (("repo-a", REPO_A_URL), ("repo-b", REPO_B_URL)):
+        st = repo_state(url)
+        check(f"{name} never activated the superseded candidate",
+              op_status(url, old_id, name, "activate") == 404)
+        check(f"{name} pointer is the newer release", st.get("active_digest") == new_sha,
+              f"active={st.get('active_digest')}")
+        check(f"{name} activated exactly once across the fence swap",
+              st.get("activation_count") == before[url] + 1,
+              f"count={st.get('activation_count')} before={before[url]}")
+
+    # --- Part 2: head with ONE persisted activation must block followers ---
+    http_json("POST", f"{REPO_B_URL}/fault/stall-activate", {}, timeout=5)
+    head_id, wait_id = f"fence-head-{ts}", f"fence-wait-{ts}"
+    head_art, wait_art = b"fence-head-bytes", b"fence-wait-bytes"
+    head_sha, wait_sha = sha256_hex(head_art), sha256_hex(wait_art)
+    s, _ = post_release_json(head_id, head_art)
+    check("fence head accepted", s == 202, f"status={s}")
+
+    def head_partial():
+        b = get_release(head_id)[1]
+        repos = b.get("repos") or {}
+        a = (repos.get("repo-a") or {}).get("activate")
+        bb = (repos.get("repo-b") or {}).get("activate")
+        return b if a and not bb else None
+
+    wait_until("head activated repo-a while repo-b is evidence-free", head_partial, 45)
+    s, _ = post_release_json(wait_id, wait_art)
+    check("follower accepted", s == 202, f"status={s}")
+    w = wait_release(wait_id, "WAITING")
+    check("follower waits behind the head that holds activation evidence",
+          any(x.get("release_id") == head_id for x in (w.get("waiting_for") or [])),
+          f"waiting_for={w.get('waiting_for')}")
+    time.sleep(1.0)
+    check("follower never prepared/activated while waiting",
+          op_status(REPO_A_URL, wait_id, "repo-a", "activate") == 404
+          and op_status(REPO_A_URL, wait_id, "repo-a", "prepare") == 404)
+
+    http_json("POST", f"{REPO_B_URL}/fault/unstall-activate", {}, timeout=5)
+    wait_release(head_id, "COMPLETED")
+    check("head converges to its own digest",
+          get_release(head_id)[1].get("current_digest") == head_sha)
+    wd = wait_release(wait_id, "COMPLETED")
+    check("follower only completes after the head", wd.get("current_digest") == wait_sha)
+    time.sleep(0.5)
+    for name, url in (("repo-a", REPO_A_URL), ("repo-b", REPO_B_URL)):
+        check(f"{name} final pointer is the in-order follower",
+              repo_state(url).get("active_digest") == wait_sha)
+    check("two repos never held pointers at different positions",
+          repo_state(REPO_A_URL).get("active_digest")
+          == repo_state(REPO_B_URL).get("active_digest") == wait_sha)
+
+
+# ---------------------------------------------------------------------------
 # Phase B: code tests
 # ---------------------------------------------------------------------------
 def phase_tests():
@@ -333,7 +440,7 @@ def main() -> int:
         rid, artifact, sha = phase_scenario()
     except Exception as e:  # noqa: BLE001
         check("phase A (disconnect/restart scenario)", False, repr(e))
-    for phase in (phase_tests, phase_build):
+    for phase in (phase_fence, phase_tests, phase_build):
         try:
             phase()
         except Exception as e:  # noqa: BLE001
