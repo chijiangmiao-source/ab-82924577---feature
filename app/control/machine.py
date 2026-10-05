@@ -24,6 +24,12 @@ class Rejected(Exception):
 
 
 class ReleaseMachine:
+    """Drives one release through prepare/activate across both mirror repos.
+
+    Only ever invoked for the current fence head (see Worker); terminal
+    states — including SUPERSEDED — are locked and never rewritten.
+    """
+
     def __init__(self, store, clients: dict, secrets: dict):
         self.store = store
         self.clients = clients  # repo name -> RepoClient
@@ -151,16 +157,24 @@ class ReleaseMachine:
 
 
 class Worker(threading.Thread):
-    """Background reconciler: advances every non-terminal release.
+    """Background reconciler: advances only the release holding the fence.
 
-    On process start it picks up all unfinished releases from the durable
-    store, which is what makes a control-service restart converge.
+    The fence head is the oldest non-terminal release; every newer candidate
+    either waits behind it (the head left repo-side activation evidence) or
+    has already been superseded on the submission path. Each tick runs under
+    the fence lock, which serializes repo operations against the supersede
+    decisions made when new releases are persisted, so a superseded release
+    can never trigger another prepare/activate. On process start the head is
+    re-derived from the durable store, which is what makes a control-service
+    restart converge to the same queue conclusion.
     """
 
-    def __init__(self, store, machine: ReleaseMachine, interval: float = 0.5):
+    def __init__(self, store, machine: ReleaseMachine, fence_lock: threading.RLock,
+                 interval: float = 0.5):
         super().__init__(name="control-worker", daemon=True)
         self.store = store
         self.machine = machine
+        self.fence_lock = fence_lock
         self.interval = interval
         self._stop_event = threading.Event()
 
@@ -170,10 +184,10 @@ class Worker(threading.Thread):
     def run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                for rid in self.store.pending_release_ids(core.TERMINAL_STATES):
-                    if self._stop_event.is_set():
-                        break
-                    self.machine.advance(rid)
+                with self.fence_lock:
+                    rid = self.store.head_release_id()
+                    if rid is not None:
+                        self.machine.advance(rid)
             except Exception:  # noqa: BLE001 - never kill the worker
                 log.exception("worker tick failed")
             self._stop_event.wait(self.interval)

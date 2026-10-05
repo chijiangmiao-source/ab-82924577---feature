@@ -35,12 +35,20 @@ def release_view(store: Store, rel: dict, repo_names) -> dict:
         activated.append(act.get("digest") if act else None)
     # The "current digest" is only real once both repos activated the same sha.
     current = rel["sha256"] if all(d == rel["sha256"] for d in activated) else None
+    blocked_by = None
+    if rel["state"] == core.STATE_WAITING:
+        # An older candidate holds repo-side activation evidence; this
+        # release only enters coordination after that holder converges.
+        blocked_by = store.blocking_release_id(rel["release_id"])
     return {
         "release_id": rel["release_id"],
+        "seq": rel.get("seq"),
         "sha256": rel["sha256"],
         "size": rel["size"],
         "state": rel["state"],
         "error": rel["error"],
+        "superseded_by": rel.get("superseded_by"),
+        "blocked_by": blocked_by,
         "current_digest": current,
         "created_at": rel["created_at"],
         "updated_at": rel["updated_at"],
@@ -48,7 +56,7 @@ def release_view(store: Store, rel: dict, repo_names) -> dict:
     }
 
 
-def build_app(store: Store, repo_names, boot_id: str,
+def build_app(store: Store, repo_names, boot_id: str, fence_lock,
               fault_hooks: bool = False, restart_delay: float = 0.4) -> App:
     app = App("control")
 
@@ -82,14 +90,24 @@ def build_app(store: Store, repo_names, boot_id: str,
                 {"state": existing["state"], "sha256": existing["sha256"]},
             )
         # Persist sha256 + the immutable release intent BEFORE any repo call.
-        try:
-            store.insert_release(rid, sha, artifact, core.STATE_PENDING)
-        except sqlite3.IntegrityError:
-            existing = store.get_release(rid)
-            if existing and existing["sha256"] == sha:
-                return 200, release_view(store, existing, repo_names)
-            raise ApiError(409, "release_id_in_use", f"发布标识 {rid} 已被使用")
-        log.info("release intent persisted: %s sha256=%s size=%d", rid, sha, len(artifact))
+        # The fence decision (superseding older evidence-free candidates, or
+        # waiting behind an evidence-bearing one) commits in the SAME
+        # transaction, under the fence lock that also serializes worker ticks.
+        with fence_lock:
+            try:
+                initial_state, superseded = store.insert_release_with_fence(
+                    rid, sha, artifact
+                )
+            except sqlite3.IntegrityError:
+                existing = store.get_release(rid)
+                if existing and existing["sha256"] == sha:
+                    return 200, release_view(store, existing, repo_names)
+                raise ApiError(409, "release_id_in_use", f"发布标识 {rid} 已被使用")
+        for old in superseded:
+            log.info("release %s superseded by %s (no repo-side activation "
+                     "evidence); it will never prepare/activate", old, rid)
+        log.info("release intent persisted: %s sha256=%s size=%d state=%s",
+                 rid, sha, len(artifact), initial_state)
         return 202, release_view(store, store.get_release(rid), repo_names)
 
     @app.route("GET", "/api/releases")
@@ -131,10 +149,13 @@ class ControlService:
             name: RepoClient(name, url, timeout=repo_timeout)
             for name, url in repo_urls.items()
         }
+        # Serializes worker ticks against supersede decisions on submissions.
+        self.fence_lock = threading.RLock()
         self.machine = ReleaseMachine(self.store, clients, repo_secrets)
-        self.worker = Worker(self.store, self.machine, interval=worker_interval)
+        self.worker = Worker(self.store, self.machine, self.fence_lock,
+                             interval=worker_interval)
         self.app = build_app(self.store, self.repo_names, self.boot_id,
-                             fault_hooks=fault_hooks)
+                             self.fence_lock, fault_hooks=fault_hooks)
         self.httpd = make_server(self.app, host, port)
         self._thread = None
 

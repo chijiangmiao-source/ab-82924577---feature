@@ -71,14 +71,9 @@ class Cluster:
         self.dir.cleanup()
 
 
-class IntegrationTests(unittest.TestCase):
-    def setUp(self):
-        self.c = Cluster()
+class ControlApi:
+    """Shared HTTP helpers for tests driving a Cluster."""
 
-    def tearDown(self):
-        self.c.close()
-
-    # ---- helpers ----
     def post_release(self, rid: str, artifact: bytes):
         return http_json("POST", f"{self.c.control.url}/api/releases",
                          {"release_id": rid, "artifact_b64": b64(artifact)}, timeout=5)
@@ -95,6 +90,14 @@ class IntegrationTests(unittest.TestCase):
 
     def repo_state(self, repo) -> dict:
         return http_json("GET", f"{repo.url}/v1/state", timeout=5)[1]
+
+
+class IntegrationTests(ControlApi, unittest.TestCase):
+    def setUp(self):
+        self.c = Cluster()
+
+    def tearDown(self):
+        self.c.close()
 
     # ---- tests ----
     def test_happy_path_and_idempotent_duplicate(self):
@@ -220,6 +223,214 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(s, 200)
         self.assertIn('id="feedback"', text)
         self.assertIn('id="artifact"', text)
+
+
+class FenceTests(ControlApi, unittest.TestCase):
+    """Single activation fence: supersede / wait / recovery semantics."""
+
+    def setUp(self):
+        self.c = Cluster()
+
+    def tearDown(self):
+        self.c.close()
+
+    # ---- helpers ----
+    def disconnect_repos(self):
+        for repo in (self.c.repo_a, self.c.repo_b):
+            s, _ = http_json("POST", f"{repo.url}/fault/disconnect", {}, timeout=5)
+            self.assertEqual(s, 200)
+
+    def recover_repos(self):
+        for repo in (self.c.repo_a, self.c.repo_b):
+            s, _ = http_json("POST", f"{repo.url}/fault/recover", {}, timeout=5)
+            self.assertEqual(s, 200)
+
+    def wait_activating_with_b_dark(self, rid: str) -> dict:
+        """Wait until rid holds a repo-a activate receipt while repo-b is dark."""
+        def stalled():
+            d = self.state_of(rid)
+            repos = d.get("repos") or {}
+            a = (repos.get("repo-a") or {}).get("activate")
+            bb = (repos.get("repo-b") or {}).get("activate")
+            if not (a and not bb and d.get("state") == "ACTIVATING"):
+                return None
+            s, _ = http_json("GET", f"{self.c.repo_b.url}/v1/state", timeout=2)
+            return d if s == 503 else None
+        return wait_for(stalled)
+
+    # ---- tests ----
+    def test_supersede_candidate_without_activation_evidence(self):
+        self.disconnect_repos()
+        s, b = self.post_release("fence-old", b"old-bytes")
+        self.assertEqual(s, 202)
+        self.assertEqual(b["state"], "PENDING")
+        s, b = self.post_release("fence-new", b"new-bytes")
+        self.assertEqual(s, 202)
+        # The older candidate had no activation evidence -> superseded;
+        # the newer one immediately holds the fence.
+        self.assertEqual(b["state"], "PENDING")
+
+        d = self.state_of("fence-old")
+        self.assertEqual(d["state"], "SUPERSEDED")
+        self.assertEqual(d["superseded_by"], "fence-new")
+        self.assertIsNone(d["current_digest"])
+
+        self.recover_repos()
+        d = self.wait_state("fence-new", "COMPLETED")
+        self.assertEqual(d["current_digest"], sha(b"new-bytes"))
+
+        # The superseded release never triggered any repo-side operation.
+        d = self.state_of("fence-old")
+        self.assertEqual(d["state"], "SUPERSEDED")
+        self.assertEqual(d["superseded_by"], "fence-new")
+        for repo in ("repo-a", "repo-b"):
+            self.assertIsNone(d["repos"][repo]["prepare"])
+            self.assertIsNone(d["repos"][repo]["activate"])
+        for repo in (self.c.repo_a, self.c.repo_b):
+            st = self.repo_state(repo)
+            self.assertEqual(st["prepare_count"], 1)
+            self.assertEqual(st["activation_count"], 1)
+            self.assertEqual(st["active_digest"], sha(b"new-bytes"))
+            key = urllib.parse.quote(op_key("fence-old", st["repo"], "prepare"), safe="")
+            s, _ = http_json("GET", f"{repo.url}/v1/ops/{key}", timeout=5)
+            self.assertEqual(s, 404)  # no repo-side op key for the old candidate
+
+        # Idempotent replay of a superseded release keeps its terminal state.
+        s, b = self.post_release("fence-old", b"old-bytes")
+        self.assertEqual(s, 200)
+        self.assertEqual(b["state"], "SUPERSEDED")
+        self.assertEqual(b["superseded_by"], "fence-new")
+        s, b = self.post_release("fence-old", b"other-bytes")
+        self.assertEqual(s, 409)
+        self.assertEqual(b["error"]["code"], "release_id_in_use")
+
+    def test_supersede_chain_newest_submission_wins(self):
+        self.disconnect_repos()
+        self.post_release("chain-1", b"c1")
+        self.post_release("chain-2", b"c2")
+        s, b = self.post_release("chain-3", b"c3")
+        self.assertEqual(s, 202)
+        self.assertEqual(b["state"], "PENDING")
+
+        self.assertEqual(self.state_of("chain-1")["state"], "SUPERSEDED")
+        self.assertEqual(self.state_of("chain-1")["superseded_by"], "chain-2")
+        self.assertEqual(self.state_of("chain-2")["state"], "SUPERSEDED")
+        self.assertEqual(self.state_of("chain-2")["superseded_by"], "chain-3")
+
+        self.recover_repos()
+        d = self.wait_state("chain-3", "COMPLETED")
+        self.assertEqual(d["current_digest"], sha(b"c3"))
+        for repo in (self.c.repo_a, self.c.repo_b):
+            st = self.repo_state(repo)
+            self.assertEqual(st["activation_count"], 1)  # only the newest one
+            self.assertEqual(st["active_digest"], sha(b"c3"))
+        self.assertEqual(self.state_of("chain-1")["state"], "SUPERSEDED")
+        self.assertEqual(self.state_of("chain-2")["state"], "SUPERSEDED")
+
+    def test_waits_for_older_candidate_with_activation_evidence(self):
+        http_json("POST", f"{self.c.repo_b.url}/fault/disconnect-after-activate",
+                  {}, timeout=5)
+        s, b = self.post_release("hold-1", b"hold-bytes")
+        self.assertEqual(s, 202)
+        self.wait_activating_with_b_dark("hold-1")
+
+        s, b = self.post_release("hold-2", b"next-bytes")
+        self.assertEqual(s, 202)
+        self.assertEqual(b["state"], "WAITING")
+        self.assertEqual(b["blocked_by"], "hold-1")
+
+        # The evidence-bearing older candidate is NOT superseded.
+        d = self.state_of("hold-1")
+        self.assertEqual(d["state"], "ACTIVATING")
+        self.assertIsNone(d["superseded_by"])
+
+        # While hold-1 has not converged, hold-2 must not touch any repo:
+        # nothing on the reachable repo, and no evidence in the control view.
+        for op in ("prepare", "activate"):
+            key = urllib.parse.quote(op_key("hold-2", "repo-a", op), safe="")
+            s, _ = http_json("GET", f"{self.c.repo_a.url}/v1/ops/{key}", timeout=5)
+            self.assertEqual(s, 404)
+        d = self.state_of("hold-2")
+        for repo in ("repo-a", "repo-b"):
+            self.assertIsNone(d["repos"][repo]["prepare"])
+            self.assertIsNone(d["repos"][repo]["activate"])
+
+        http_json("POST", f"{self.c.repo_b.url}/fault/recover", {}, timeout=5)
+        d1 = self.wait_state("hold-1", "COMPLETED")
+        self.assertEqual(d1["current_digest"], sha(b"hold-bytes"))
+        # hold-2 enters coordination only after hold-1 converged.
+        d2 = self.wait_state("hold-2", "COMPLETED")
+        self.assertEqual(d2["current_digest"], sha(b"next-bytes"))
+        # Ordering proof: hold-2's first repo-side receipt is younger than the
+        # moment hold-1 converged (same host clock, ISO-8601 strings).
+        self.assertGreater(d2["repos"]["repo-a"]["prepare"]["ts"], d1["updated_at"])
+        for repo in (self.c.repo_a, self.c.repo_b):
+            st = self.repo_state(repo)
+            self.assertEqual(st["activation_count"], 2)  # hold-1 once, hold-2 once
+            self.assertEqual(st["active_digest"], sha(b"next-bytes"))
+
+    def test_restart_recovers_same_queue_conclusion(self):
+        http_json("POST", f"{self.c.repo_b.url}/fault/disconnect-after-activate",
+                  {}, timeout=5)
+        self.post_release("rec-1", b"rec-one")
+        self.wait_activating_with_b_dark("rec-1")
+        s, b = self.post_release("rec-2", b"rec-two")
+        self.assertEqual(b["state"], "WAITING")
+
+        self.c.restart_control()
+
+        # Same queue conclusion after the restart: rec-1 keeps the fence,
+        # rec-2 still waits behind it, neither was superseded.
+        d1 = self.state_of("rec-1")
+        self.assertEqual(d1["state"], "ACTIVATING")
+        self.assertIsNone(d1["superseded_by"])
+        d2 = self.state_of("rec-2")
+        self.assertEqual(d2["state"], "WAITING")
+        self.assertEqual(d2["blocked_by"], "rec-1")
+
+        http_json("POST", f"{self.c.repo_b.url}/fault/recover", {}, timeout=5)
+        self.wait_state("rec-1", "COMPLETED")
+        self.wait_state("rec-2", "COMPLETED")
+        sb = self.repo_state(self.c.repo_b)
+        self.assertEqual(sb["activation_count"], 2)  # rec-1 adopted, rec-2 once
+        self.assertEqual(sb["active_digest"], sha(b"rec-two"))
+
+    def test_superseded_state_survives_restart(self):
+        self.disconnect_repos()
+        self.post_release("sup-1", b"s1")
+        self.post_release("sup-2", b"s2")
+        self.assertEqual(self.state_of("sup-1")["state"], "SUPERSEDED")
+
+        self.c.restart_control()
+
+        d = self.state_of("sup-1")
+        self.assertEqual(d["state"], "SUPERSEDED")
+        self.assertEqual(d["superseded_by"], "sup-2")
+
+        self.recover_repos()
+        self.wait_state("sup-2", "COMPLETED")
+        d = self.state_of("sup-1")
+        self.assertEqual(d["state"], "SUPERSEDED")  # locked, never drifts
+        for repo in ("repo-a", "repo-b"):
+            self.assertIsNone(d["repos"][repo]["prepare"])
+            self.assertIsNone(d["repos"][repo]["activate"])
+
+    def test_list_and_detail_expose_queue_fields(self):
+        self.disconnect_repos()
+        self.post_release("q-1", b"q1")
+        self.post_release("q-2", b"q2")
+        s, b = http_json("GET", f"{self.c.control.url}/api/releases", timeout=5)
+        self.assertEqual(s, 200)
+        rels = {r["release_id"]: r for r in b["releases"]}
+        self.assertEqual(rels["q-1"]["state"], "SUPERSEDED")
+        self.assertEqual(rels["q-1"]["superseded_by"], "q-2")
+        self.assertEqual(rels["q-2"]["state"], "PENDING")
+        self.assertLess(rels["q-1"]["seq"], rels["q-2"]["seq"])
+
+        d = self.state_of("q-2")
+        self.assertIsNone(d["blocked_by"])  # fence head waits for nobody
+        self.recover_repos()
+        self.wait_state("q-2", "COMPLETED")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,9 @@ Phase order (per acceptance spec):
   A. Disconnect/restart convergence scenario: arm repo-b to drop its response
      right after committing the activation, restart the control service, then
      check both repos' final digests and the release evidence.
+  A2. Single activation fence: supersede of an evidence-free candidate,
+      waiting behind an evidence-bearing one, and queue-conclusion recovery
+      across a control-service restart.
   B. Code tests (unittest discover).
   C. Build check (byte-compile every source file).
   D. HTTP smoke against the health page and the release API.
@@ -160,6 +163,188 @@ def phase_scenario():
           s == 200 and repo_receipt.get("receipt_id") == ctrl_receipt.get("receipt_id"),
           f"repo={repo_receipt.get('receipt_id')} control={ctrl_receipt.get('receipt_id')}")
     return rid, artifact, sha
+
+
+# ---------------------------------------------------------------------------
+# Phase A2: single activation fence (supersede / wait / restart recovery)
+# ---------------------------------------------------------------------------
+def phase_fence():
+    print("== Phase A2: 单一激活栅栏（淘汰 / 等待 / 重启恢复队列结论）==", flush=True)
+    ts = int(time.time())
+
+    def completed(rid):
+        s, b = get_release(rid)
+        return b if s == 200 and b.get("state") == "COMPLETED" else None
+
+    # -- Scenario 1: an evidence-free older candidate is superseded --------
+    r1, r2 = f"fen-old-{ts}", f"fen-new-{ts}"
+    art2 = f"fence-new:{r2}".encode()
+    sha2 = sha256_hex(art2)
+    a_base = repo_state(REPO_A_URL)["activation_count"]
+    b_base = repo_state(REPO_B_URL)["activation_count"]
+
+    s1, _ = http_json("POST", f"{REPO_A_URL}/fault/disconnect", {}, timeout=5)
+    s2, _ = http_json("POST", f"{REPO_B_URL}/fault/disconnect", {}, timeout=5)
+    check("both repos disconnected", s1 == 200 and s2 == 200, f"{s1}/{s2}")
+
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": r1,
+                      "artifact_b64": base64.b64encode(b"fence-old").decode()},
+                     timeout=10)
+    check("older candidate accepted", s == 202, f"status={s}")
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": r2,
+                      "artifact_b64": base64.b64encode(art2).decode()},
+                     timeout=10)
+    check("newer candidate accepted as fence head",
+          s == 202 and b.get("state") == "PENDING",
+          f"status={s} state={b.get('state')}")
+
+    s, b = get_release(r1)
+    check("evidence-free older candidate superseded by the newer one",
+          s == 200 and b.get("state") == "SUPERSEDED" and b.get("superseded_by") == r2,
+          f"state={b.get('state')} superseded_by={b.get('superseded_by')}")
+
+    s, b = http_json("GET", f"{CONTROL_URL}/api/releases", timeout=5)
+    rels = {r["release_id"]: r for r in (b.get("releases") or [])}
+    check("release list shows which release superseded the old candidate",
+          s == 200 and rels.get(r1, {}).get("superseded_by") == r2,
+          f"row={rels.get(r1)}")
+    check("release list exposes first-persistence order (seq)",
+          rels.get(r1, {}).get("seq") is not None
+          and rels.get(r2, {}).get("seq") is not None
+          and rels[r1]["seq"] < rels[r2]["seq"])
+
+    http_json("POST", f"{REPO_A_URL}/fault/recover", {}, timeout=5)
+    http_json("POST", f"{REPO_B_URL}/fault/recover", {}, timeout=5)
+    d = wait_until("newer candidate completed", lambda: completed(r2), 45)
+    check("newer candidate digest visible", d.get("current_digest") == sha2)
+
+    s, b = get_release(r1)
+    repos = b.get("repos") or {}
+    no_evidence = all((repos.get(rp) or {}).get(op) is None
+                      for rp in ("repo-a", "repo-b") for op in ("prepare", "activate"))
+    check("superseded candidate stayed superseded with zero repo-side evidence",
+          b.get("state") == "SUPERSEDED" and no_evidence,
+          f"state={b.get('state')} repos={repos}")
+    sa, sb = repo_state(REPO_A_URL), repo_state(REPO_B_URL)
+    check("superseded candidate never activated on repo-a",
+          sa["activation_count"] == a_base + 1, f"count={sa['activation_count']}")
+    check("superseded candidate never activated on repo-b",
+          sb["activation_count"] == b_base + 1, f"count={sb['activation_count']}")
+    check("both repos point at the newer candidate",
+          sa["active_digest"] == sha2 and sb["active_digest"] == sha2,
+          f"a={sa['active_digest']} b={sb['active_digest']}")
+    key = urllib.parse.quote(op_key(r1, "repo-a", "prepare"), safe="")
+    s, _ = http_json("GET", f"{REPO_A_URL}/v1/ops/{key}", timeout=5)
+    check("no repo-side op key exists for the superseded candidate",
+          s == 404, f"status={s}")
+
+    # -- Scenario 2: an evidence-bearing holder makes newer releases wait --
+    r3, r4 = f"fen-hold-{ts}", f"fen-wait-{ts}"
+    art3 = f"fence-hold:{r3}".encode()
+    art4 = f"fence-wait:{r4}".encode()
+    sha3, sha4 = sha256_hex(art3), sha256_hex(art4)
+    s, _ = http_json("POST", f"{REPO_B_URL}/fault/disconnect-after-activate",
+                     {}, timeout=5)
+    check("arm repo-b disconnect-after-activate (fence)", s == 200, f"status={s}")
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": r3,
+                      "artifact_b64": base64.b64encode(art3).decode()},
+                     timeout=10)
+    check("fence holder accepted", s == 202, f"status={s}")
+
+    def activating():
+        s, b = get_release(r3)
+        if s != 200:
+            return None
+        repos = b.get("repos") or {}
+        a = (repos.get("repo-a") or {}).get("activate")
+        bb = (repos.get("repo-b") or {}).get("activate")
+        if not (a and not bb):
+            return None
+        s2, _ = http_json("GET", f"{REPO_B_URL}/v1/state", timeout=3)
+        return b if s2 == 503 else None
+
+    wait_until("holder activating with repo-b dark", activating, 45)
+
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": r4,
+                      "artifact_b64": base64.b64encode(art4).decode()},
+                     timeout=10)
+    check("newer candidate waits behind the evidence-bearing holder",
+          s == 202 and b.get("state") == "WAITING" and b.get("blocked_by") == r3,
+          f"status={s} state={b.get('state')} blocked_by={b.get('blocked_by')}")
+    s, b = get_release(r3)
+    check("evidence-bearing holder NOT superseded",
+          s == 200 and b.get("state") != "SUPERSEDED", f"state={b.get('state')}")
+
+    # Restart the control service: the same queue conclusion must be
+    # recovered from the durable intents and the repo-side receipts.
+    s, b = http_json("GET", f"{CONTROL_URL}/healthz", timeout=5)
+    old_boot = b.get("boot_id")
+    s, _ = http_json("POST", f"{CONTROL_URL}/fault/restart", {}, timeout=5)
+    check("control restart hook accepted (fence)", s == 200, f"status={s}")
+
+    def restarted():
+        try:
+            s, b = http_json("GET", f"{CONTROL_URL}/healthz", timeout=3)
+        except TransportError:
+            return False
+        return s == 200 and b.get("boot_id") not in (None, old_boot)
+
+    wait_until("control process actually restarted (fence)", restarted, 90, 0.3)
+    s, b = get_release(r3)
+    check("holder keeps the fence after the restart",
+          s == 200 and b.get("state") == "ACTIVATING", f"state={b.get('state')}")
+    s, b = get_release(r4)
+    check("waiter still waits behind the holder after the restart",
+          s == 200 and b.get("state") == "WAITING" and b.get("blocked_by") == r3,
+          f"state={b.get('state')} blocked_by={b.get('blocked_by')}")
+
+    s, _ = http_json("POST", f"{REPO_B_URL}/fault/recover", {}, timeout=5)
+    check("repo-b recovered (fence)", s == 200, f"status={s}")
+
+    violated = []
+
+    def holder_done():
+        s, b3 = get_release(r3)
+        if s == 200 and b3.get("state") == "COMPLETED":
+            return b3
+        # r3 has not converged yet: the waiter must hold no activation
+        # evidence on either repo at this point in time.
+        s, b4 = get_release(r4)
+        if s == 200:
+            for rp in ("repo-a", "repo-b"):
+                if ((b4.get("repos") or {}).get(rp) or {}).get("activate"):
+                    # Re-confirm the holder is still unconverged before
+                    # blaming the waiter (it may have converged in between).
+                    s2, b3b = get_release(r3)
+                    if not (s2 == 200 and b3b.get("state") == "COMPLETED"):
+                        violated.append(rp)
+        return None
+
+    d3 = wait_until("holder converged to COMPLETED", holder_done, 45)
+    check("holder completed via the adopted repo-b receipt",
+          d3.get("current_digest") == sha3, f"current={d3.get('current_digest')}")
+    check("waiter never activated before the holder converged",
+          not violated, f"violated_on={violated}")
+    d4 = wait_until("waiter completed after the holder", lambda: completed(r4), 45)
+    check("waiter completed in order", d4.get("current_digest") == sha4,
+          f"current={d4.get('current_digest')}")
+    # Deterministic ordering proof (same host clock, ISO-8601 strings):
+    # every waiter-side activation is younger than the holder's convergence.
+    wait_repos = d4.get("repos") or {}
+    ordered = all(
+        ((wait_repos.get(rp) or {}).get(op) or {}).get("ts", "") > d3["updated_at"]
+        for rp in ("repo-a", "repo-b") for op in ("prepare", "activate")
+    )
+    check("waiter repo-side evidence is all younger than the holder's convergence",
+          ordered, f"holder_converged={d3['updated_at']}")
+    sa, sb = repo_state(REPO_A_URL), repo_state(REPO_B_URL)
+    check("final active pointers both belong to the newest release",
+          sa["active_digest"] == sha4 and sb["active_digest"] == sha4,
+          f"a={sa['active_digest']} b={sb['active_digest']}")
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +518,10 @@ def main() -> int:
         rid, artifact, sha = phase_scenario()
     except Exception as e:  # noqa: BLE001
         check("phase A (disconnect/restart scenario)", False, repr(e))
+    try:
+        phase_fence()
+    except Exception as e:  # noqa: BLE001
+        check("phase A2 (activation fence)", False, repr(e))
     for phase in (phase_tests, phase_build):
         try:
             phase()

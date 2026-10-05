@@ -20,8 +20,12 @@
   th, td { border: 1px solid #8884; padding: .3rem .5rem; text-align: left; }
   code { font-family: ui-monospace, monospace; }
   .mono { font-family: ui-monospace, monospace; font-size: .78rem; word-break: break-all; }
+  .hint { font-size: .82rem; opacity: .75; margin: .4rem 0 0; }
+  .fence { border-left: 3px solid #8888; padding: .35rem .7rem; font-size: .86rem; background: #8881; border-radius: 4px; }
   .state-COMPLETED { color: #1c9c4c; font-weight: 700; }
   .state-REJECTED { color: #d05050; font-weight: 700; }
+  .state-SUPERSEDED { color: #8a8a8a; font-weight: 700; }
+  .state-WAITING { color: #7a6cff; font-weight: 700; }
   .state-PENDING, .state-PREPARING, .state-ACTIVATING { color: #c08a00; font-weight: 700; }
 </style>
 </head>
@@ -40,7 +44,7 @@
 </section>
 
 <section>
-  <h2>按标识查询（进度 / 当前摘要 / 准备与激活证据）</h2>
+  <h2>按标识查询（进度 / 当前摘要 / 准备与激活证据 / 栅栏资格）</h2>
   <label for="qid">发布标识</label>
   <input type="text" id="qid">
   <button id="query">查询</button>
@@ -48,7 +52,8 @@
 </section>
 
 <section>
-  <h2>全部发布</h2>
+  <h2>全部发布（单一激活栅栏 · 按首次持久化顺序）</h2>
+  <p class="hint">任意时刻只有顺位最旧的未决发布持有激活栅栏并进入协调。未留下任何仓端激活证据的旧候选会被后续提交淘汰（SUPERSEDED，永不再触发准备/激活）；已留下激活证据的旧候选会令后续发布等待（WAITING），直至其依据既有回执收敛为 COMPLETED 或 REJECTED，后续发布再依序进入协调。</p>
   <div id="list">加载中…</div>
 </section>
 
@@ -105,6 +110,25 @@ $("publish").addEventListener("click", async () => {
   }
 });
 
+function fenceNote(b) {
+  switch (b.state) {
+    case "WAITING":
+      return `未持有激活栅栏：旧发布 ${b.blocked_by || "?"} 已留下仓端激活证据，须待其依据既有回执收敛为完成或拒绝后，本发布才依序进入协调；此前不会触发任何准备/激活。`;
+    case "SUPERSEDED":
+      return `已失去激活资格：被后续发布 ${b.superseded_by || "?"} 取代。本发布未留下任何仓端激活证据，不会再触发准备或激活，仓端活动指针不受其影响。`;
+    case "PENDING":
+    case "PREPARING":
+    case "ACTIVATING":
+      return `持有激活栅栏（顺位 #${b.seq}）：正在或即将协调双仓；两仓活动指针只会在本发布收敛后移交给下一顺位。`;
+    case "COMPLETED":
+      return "两仓激活回执摘要均等于发布 SHA-256，发布已完成，当前摘要对外可见。";
+    case "REJECTED":
+      return "仓端证据与发布摘要不符（或操作键冲突/签名不符），发布已锁定为拒绝，激活资格已撤销，状态不再漂移。";
+    default:
+      return "";
+  }
+}
+
 function receiptRow(repo, op, r) {
   if (!r) return `<tr><td>${repo}</td><td>${op}</td><td colspan="4">—</td></tr>`;
   return `<tr><td>${repo}</td><td>${op}</td><td class="mono">${short(r.digest)}</td>` +
@@ -120,11 +144,15 @@ async function query() {
     $("detail").innerHTML = `<p>${(body.error && body.error.message) || "查询失败"}</p>`;
     return;
   }
-  let html = `<p>状态：<span class="state-${body.state}">${body.state}</span><br>` +
+  let html = `<p>状态：<span class="state-${body.state}">${body.state}</span>` +
+    `（顺位 #${body.seq}）<br>` +
     `SHA-256：<code>${body.sha256}</code><br>` +
     `当前摘要：<code>${body.current_digest || "—"}</code><br>` +
+    (body.superseded_by ? `取代者：<code>${body.superseded_by}</code><br>` : "") +
+    (body.blocked_by ? `等待：<code>${body.blocked_by}</code> 收敛<br>` : "") +
     (body.error ? `错误：<code>${body.error}</code><br>` : "") +
     `大小：${body.size} 字节</p>`;
+  html += `<p class="fence">${fenceNote(body)}</p>`;
   html += `<table><tr><th>镜像仓</th><th>操作</th><th>摘要</th><th>回执 ID</th>` +
     `<th>时间</th><th>签名</th></tr>`;
   for (const repo of Object.keys(body.repos)) {
@@ -140,12 +168,14 @@ $("query").addEventListener("click", query);
 async function refreshList() {
   const { body } = await api("GET", "/api/releases");
   const rows = (body.releases || []).map(r =>
-    `<tr><td class="mono">${r.release_id}</td><td class="mono">${short(r.sha256)}</td>` +
-    `<td class="state-${r.state}">${r.state}</td><td>${r.size}</td>` +
-    `<td>${r.updated_at}</td></tr>`).join("");
+    `<tr><td>${r.seq != null ? r.seq : ""}</td>` +
+    `<td class="mono">${r.release_id}</td><td class="mono">${short(r.sha256)}</td>` +
+    `<td class="state-${r.state}">${r.state}</td>` +
+    `<td class="mono">${r.superseded_by || "—"}</td>` +
+    `<td>${r.size}</td><td>${r.updated_at}</td></tr>`).join("");
   $("list").innerHTML = rows
-    ? `<table><tr><th>发布标识</th><th>SHA-256</th><th>状态</th><th>大小</th>` +
-      `<th>更新时间</th></tr>${rows}</table>`
+    ? `<table><tr><th>顺位</th><th>发布标识</th><th>SHA-256</th><th>状态</th>` +
+      `<th>取代者</th><th>大小</th><th>更新时间</th></tr>${rows}</table>`
     : "<p>暂无发布</p>";
 }
 

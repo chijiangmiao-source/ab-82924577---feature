@@ -38,6 +38,17 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 
 - **先持久化，后执行**：`POST /api/releases` 先把 `sha256` 与不可变发布意图
   （标识 → 摘要 + 字节）写入 SQLite，再由后台协调器驱动仓端操作。
+- **单一激活栅栏**：全部发布按首次持久化顺序（`seq`）排队，任意时刻只有
+  顺位最旧的未决发布持有栅栏并进入协调，因此两仓活动指针永远不会分别
+  归属互不相干的发布。提交新发布时，淘汰决策与新意图在**同一事务**落盘：
+  - 更旧的未决候选若**未留下任何仓端激活证据**（无 activate 回执），
+    立即被新发布淘汰为 `SUPERSEDED`（终态），详情与列表中的
+    `superseded_by` 指明取代者，且它永不再触发准备或激活；
+  - 更旧的候选若**已留下任一仓的持久化激活证据**，新发布进入
+    `WAITING`（`blocked_by` 指明阻塞者），待旧候选依据既有回执收敛为
+    `COMPLETED` 或 `REJECTED` 后，再依序进入协调。
+  栅栏切换、仓端响应丢失或控制服务重启后，队列结论都从持久化意图与
+  仓端回执恢复，不会漂移。
 - **仓端操作键**：`rel:{发布标识}:{仓}:{prepare|activate}`，由发布标识派生。
   仓端按键幂等：同键同摘要回放**首次回执**（receipt_id 不变、激活计数不增）；
   同键异摘要返回 `409 op_key_conflict` 明确拒绝。
@@ -57,11 +68,11 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 控制台页面（发布表单 + 反馈区 + 按标识查询证据） |
+| GET | `/` | 控制台页面（发布表单 + 反馈区 + 按标识查询证据 + 栅栏队列） |
 | GET | `/healthz` | 健康响应（含 `boot_id`） |
 | POST | `/api/releases` | 提交 `{release_id, artifact_b64}` → `202/200/409/400/413` |
-| GET | `/api/releases/{id}` | 进度、当前摘要、双仓准备/激活证据（签名回执） |
-| GET | `/api/releases` | 全部发布列表 |
+| GET | `/api/releases/{id}` | 顺位、进度、当前摘要、双仓准备/激活证据（签名回执）、`superseded_by` / `blocked_by` |
+| GET | `/api/releases` | 全部发布列表（含顺位 `seq` 与 `superseded_by`） |
 
 仓端（仅内部网络）：`POST /v1/prepare`、`POST /v1/activate`、
 `GET /v1/ops/{op_key}`、`GET /v1/state`、`GET /healthz`。
@@ -73,10 +84,15 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 1. **断连/重启场景**：武装 repo-b「激活提交后断开响应」→ 提交发布 →
    确认卡在未完成态 → 重启控制服务（新 `boot_id`）→ 恢复 repo-b →
    校验双仓最终摘要、激活次数恰为 1、准备/激活证据完整且为首次回执回放。
-2. **代码测试**：`python -m unittest discover`（单元 + 进程内集成测试，
-   集成测试覆盖同一断连/重启场景）。
-3. **构建检查**：`python -m compileall` 字节编译全部源码。
-4. **HTTP 冒烟**：健康页与发布接口（重复提交、标识复用、非法 Base64、
+2. **激活栅栏场景**：双仓断开时连续提交 → 旧候选被新候选淘汰（列表与详情
+   均显示取代者）→ 恢复后仅新候选激活；再武装 repo-b 断连 → 提交携带
+   激活证据的持有者与等待者 → 重启控制服务 → 校验队列结论恢复（持有者
+   不被淘汰、等待者仍等待）→ 持有者收敛后等待者才依序完成，等待者全程
+   未提前激活，双仓最终指针同属最新发布。
+3. **代码测试**：`python -m unittest discover`（单元 + 进程内集成测试，
+   集成测试覆盖同一断连/重启场景与栅栏的淘汰/等待/恢复语义）。
+4. **构建检查**：`python -m compileall` 字节编译全部源码。
+5. **HTTP 冒烟**：健康页与发布接口（重复提交、标识复用、非法 Base64、
    超限与 64KiB 边界、拒绝锁定、仓端幂等直测、未知标识 404）。
 
 退出码 `0` = 验收通过，非 `0` = 存在失败项（日志中逐条标注 `[FAIL]`）。
